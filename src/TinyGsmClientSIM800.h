@@ -65,6 +65,47 @@ class TinyGsmSim800 : public TinyGsmModem<TinyGsmSim800>,
   /*
    * Inner Client
    */
+
+enum class PhonebookStorageType : uint8_t {
+  SIM,    // Typical size: 250
+  Phone,  // Typical size: 100
+  Invalid
+};
+
+struct PhonebookStorage {
+  PhonebookStorageType type = PhonebookStorageType::Invalid;
+  uint8_t used  = {0};
+  uint8_t total = {0};
+};
+
+struct PhonebookEntry {
+  String number;
+  String text;
+};
+
+struct PhonebookMatches {
+  uint8_t index[TINY_GSM_PHONEBOOK_RESULTS] = {0};
+};
+
+enum class MessageStorageType : uint8_t {
+  SIM,                // SM
+  Phone,              // ME
+  SIMPreferred,       // SM_P
+  PhonePreferred,     // ME_P
+  Either_SIMPreferred // MT (use both)
+};
+
+struct MessageStorage {
+  /*
+   * [0]: Messages to be read and deleted from this memory storage
+   * [1]: Messages will be written and sent to this memory storage
+   * [2]: Received messages will be placed in this memory storage
+   */
+  MessageStorageType type[3];
+  uint8_t used[3]  = {0};
+  uint8_t total[3] = {0};
+};
+
  public:
   class GsmClientSim800 : public GsmClient {
     friend class TinyGsmSim800;
@@ -396,6 +437,16 @@ class TinyGsmSim800 : public TinyGsmModem<TinyGsmSim800>,
     return true;
   }
 
+  bool netlightEnable(bool enable = true) {
+      sendAT(GF("+CNETLIGHT="), enable);
+      bool ok = waitResponse() == 1;
+
+      sendAT(GF("+CSGS="), enable);
+      ok &= waitResponse() == 1;
+
+      return ok;
+  }
+
   /*
    * SIM card functions
    */
@@ -421,37 +472,433 @@ class TinyGsmSim800 : public TinyGsmModem<TinyGsmSim800>,
     return waitResponse() == 1;
   }
 
+  bool receiveCallerIdentification(const bool receive) {
+    sendAT(GF("+CLIP="), receive); // Calling Line Identification Presentation
+
+    // Unsolicited result code format:
+    // +CLIP: <number>,<type>[,<subaddr>,<satype>,<alphaId>,<CLIvalidity>]
+
+    return waitResponse(15000L) == 1;
+  }
+
   /*
    * Messaging functions
    */
  protected:
-  // Follows all messaging functions per template
+  Sms readSmsMessage(const uint8_t index, const bool changeStatusToRead = true) {
+    sendAT(GF("+CMGR="), index, GF(","), static_cast<const uint8_t>(!changeStatusToRead)); // Read SMS Message
+    if (waitResponse(5000L, GF(GSM_NL "+CMGR: \"")) != 1) {
+      stream.readString();
+      return {};
+    }
+
+    Sms sms;
+
+    // AT reply:
+    // <stat>,<oa>[,<alpha>],<scts>[,<tooa>,<fo>,<pid>,<dcs>,<sca>,<tosca>,<length>]<CR><LF><data>
+
+    //<stat>
+    const String res = stream.readStringUntil('"');
+    if (res == GF("REC READ")) {
+      sms.status = SmsStatus::REC_READ;
+    } else if (res == GF("REC UNREAD")) {
+      sms.status = SmsStatus::REC_UNREAD;
+    } else if (res == GF("STO UNSENT")) {
+      sms.status = SmsStatus::STO_UNSENT;
+    } else if (res == GF("STO SENT")) {
+      sms.status = SmsStatus::STO_SENT;
+    } else if (res == GF("ALL")) {
+      sms.status = SmsStatus::ALL;
+    } else {
+      stream.readString();
+      return {};
+    }
+
+    // <oa>
+    streamSkipUntil('"');
+    sms.originatingAddress = stream.readStringUntil('"');
+
+    // <alpha>
+    streamSkipUntil('"');
+    sms.phoneBookEntry = stream.readStringUntil('"');
+
+    // <scts>
+    streamSkipUntil('"');
+    sms.serviceCentreTimeStamp = stream.readStringUntil('"');
+    streamSkipUntil(',');
+
+    streamSkipUntil(','); // <tooa>
+    streamSkipUntil(','); // <fo>
+    streamSkipUntil(','); // <pid>
+
+    // <dcs>
+    const uint8_t alphabet = (stream.readStringUntil(',').toInt() >> 2) & B11;
+    switch (alphabet) {
+    case B00:
+      sms.alphabet = SmsAlphabet::GSM_7bit;
+      break;
+    case B01:
+      sms.alphabet = SmsAlphabet::Data_8bit;
+      break;
+    case B10:
+      sms.alphabet = SmsAlphabet::UCS2;
+      break;
+    case B11:
+    default:
+      sms.alphabet = SmsAlphabet::Reserved;
+      break;
+    }
+
+    streamSkipUntil(','); // <sca>
+    streamSkipUntil(','); // <tosca>
+
+    // <length>, CR, LF
+    const long length = stream.readStringUntil('\n').toInt();
+
+    // <data>
+    String data = stream.readString();
+    data.remove(static_cast<const unsigned int>(length));
+    switch (sms.alphabet) {
+    case SmsAlphabet::GSM_7bit:
+      sms.message = data;
+      break;
+    case SmsAlphabet::Data_8bit:
+      sms.message = TinyGsmDecodeHex8bit(data);
+      break;
+    case SmsAlphabet::UCS2:
+      sms.message = TinyGsmDecodeHex16bit(data);
+      break;
+    case SmsAlphabet::Reserved:
+      return {};
+    }
+
+    return sms;
+  }
+
+  MessageStorage getPreferredMessageStorage() {
+    sendAT(GF("+CPMS?")); // Preferred SMS Message Storage
+    if (waitResponse(GF(GSM_NL "+CPMS:")) != 1) {
+      stream.readString();
+      return {};
+    }
+
+    // AT reply:
+    // +CPMS: <mem1>,<used1>,<total1>,<mem2>,<used2>,<total2>,<mem3>,<used3>,<total3>
+
+    MessageStorage messageStorage;
+    for (uint8_t i = 0; i < 3; ++i) {
+      // type
+      streamSkipUntil('"');
+      const String mem = stream.readStringUntil('"');
+      if (mem == GF("SM")) {
+        messageStorage.type[i] = MessageStorageType::SIM;
+      } else if (mem == GF("ME")) {
+        messageStorage.type[i] = MessageStorageType::Phone;
+      } else if (mem == GF("SM_P")) {
+        messageStorage.type[i] = MessageStorageType::SIMPreferred;
+      } else if (mem == GF("ME_P")) {
+        messageStorage.type[i] = MessageStorageType::PhonePreferred;
+      } else if (mem == GF("MT")) {
+        messageStorage.type[i] = MessageStorageType::Either_SIMPreferred;
+      } else {
+        stream.readString();
+        return {};
+      }
+
+      // used
+      streamSkipUntil(',');
+      messageStorage.used[i] = static_cast<uint8_t>(stream.readStringUntil(',').toInt());
+
+      // total
+      if (i < 2) {
+        messageStorage.total[i] = static_cast<uint8_t>(stream.readStringUntil(',').toInt());
+      } else {
+        messageStorage.total[i] = static_cast<uint8_t>(stream.readString().toInt());
+      }
+    }
+
+    return messageStorage;
+  }
+
+  bool setPreferredMessageStorage(const MessageStorageType type[3]) {
+    const auto convertMstToString = [](const MessageStorageType &type) {
+      switch (type) {
+      case MessageStorageType::SIM:
+        return GF("\"SM\"");
+      case MessageStorageType::Phone:
+        return GF("\"ME\"");
+      case MessageStorageType::SIMPreferred:
+        return GF("\"SM_P\"");
+      case MessageStorageType::PhonePreferred:
+        return GF("\"ME_P\"");
+      case MessageStorageType::Either_SIMPreferred:
+        return GF("\"MT\"");
+      }
+
+      return GF("");
+    };
+
+    sendAT(GF("+CPMS="),
+           convertMstToString(type[0]), GF(","),
+           convertMstToString(type[1]), GF(","),
+           convertMstToString(type[2]));
+
+    return waitResponse() == 1;
+  }
+
+  bool deleteSmsMessage(const uint8_t index) {
+    sendAT(GF("+CMGD="), index, GF(","), 0); // Delete SMS Message from <mem1> location
+    return waitResponse(5000L) == 1;
+  }
+
+  bool deleteAllSmsMessages(const DeleteAllSmsMethod method) {
+    // Select SMS Message Format: PDU mode. Spares us space now
+    sendAT(GF("+CMGF=0"));
+    if (waitResponse() != 1) {
+        return false;
+    }
+
+    sendAT(GF("+CMGDA="), static_cast<const uint8_t>(method)); // Delete All SMS
+    const bool ok = waitResponse(25000L) == 1;
+
+    sendAT(GF("+CMGF=1"));
+    waitResponse();
+
+    return ok;
+  }
+
+  bool receiveNewMessageIndication(const bool enabled = true, const bool cbmIndication = false, const bool statusReport = false) {
+    sendAT(GF("+CNMI=2,"),           // New SMS Message Indications
+           enabled, GF(","),         // format: +CMTI: <mem>,<index>
+           cbmIndication, GF(","),   // format: +CBM: <sn>,<mid>,<dcs>,<page>,<pages><CR><LF><data>
+           statusReport, GF(",0"));  // format: +CDS: <fo>,<mr>[,<ra>][,<tora>],<scts>,<dt>,<st>
+
+    return waitResponse() == 1;
+  }
 
   /*
-   * GSM Location functions
+   * Phonebook functions
    */
  protected:
-  // Depending on the exacty model and firmware revision, should return a
-  // GSM-based location from CLBS as per the template
-  // TODO(?):  Check number of digits in year (2 or 4)
+  PhonebookStorage getPhonebookStorage() {
+    sendAT(GF("+CPBS?")); // Phonebook Memory Storage
+    if (waitResponse(GF(GSM_NL "+CPBS: \"")) != 1) {
+      stream.readString();
+      return {};
+    }
+
+    // AT reply:
+    // +CPBS: <storage>,<used>,<total>
+
+    PhonebookStorage phonebookStorage;
+
+    const String mem = stream.readStringUntil('"');
+    if (mem == GF("SM")) {
+      phonebookStorage.type = PhonebookStorageType::SIM;
+    } else if (mem == GF("ME")) {
+      phonebookStorage.type = PhonebookStorageType::Phone;
+    } else {
+      stream.readString();
+      return {};
+    }
+
+    // used, total
+    streamSkipUntil(',');
+    phonebookStorage.used = static_cast<uint8_t>(stream.readStringUntil(',').toInt());
+    phonebookStorage.total = static_cast<uint8_t>(stream.readString().toInt());
+
+    return phonebookStorage;
+  }
+
+  bool setPhonebookStorage(const PhonebookStorageType type) {
+    if (type == PhonebookStorageType::Invalid) {
+      return false;
+    }
+
+    const auto storage = type == PhonebookStorageType::SIM ? GF("\"SM\"") : GF("\"ME\"");
+    sendAT(GF("+CPBS="), storage); // Phonebook Memory Storage
+
+    return waitResponse() == 1;
+  }
+
+  bool addPhonebookEntry(const String &number, const String &text) {
+    // Always use international phone number style (+12345678910).
+    // Never use double quotes or backslashes in `text`, not even in escaped form.
+    // Use characters found in the GSM alphabet.
+
+    // Typical maximum length of `number`: 38
+    // Typical maximum length of `text`:   14
+
+    changeCharacterSet(GF("GSM"));
+
+    // AT format:
+    // AT+CPBW=<index>[,<number>,[<type>,[<text>]]]
+    sendAT(GF("+CPBW=,\""), number, GF("\",145,\""), text, '"');  // Write Phonebook Entry
+
+    return waitResponse(3000L) == 1;
+  }
+
+  bool deletePhonebookEntry(const uint8_t index) {
+    // AT+CPBW=<index>
+    sendAT(GF("+CPBW="), index); // Write Phonebook Entry
+
+    // Returns OK even if an empty index is deleted in the valid range
+    return waitResponse(3000L) == 1;
+  }
+
+  PhonebookEntry readPhonebookEntry(const uint8_t index) {
+    changeCharacterSet(GF("GSM"));
+    sendAT(GF("+CPBR="), index); // Read Current Phonebook Entries
+
+    // AT response:
+    // +CPBR:<index1>,<number>,<type>,<text>
+    if (waitResponse(3000L, GF(GSM_NL "+CPBR: ")) != 1) {
+      stream.readString();
+      return {};
+    }
+
+    PhonebookEntry phonebookEntry;
+    streamSkipUntil('"');
+    phonebookEntry.number = stream.readStringUntil('"');
+    streamSkipUntil('"');
+    phonebookEntry.text = stream.readStringUntil('"');
+
+    waitResponse();
+
+    return phonebookEntry;
+  }
+
+  PhonebookMatches findPhonebookEntries(const String &needle) {
+    // Search among the `text` entries only.
+    // Only the first TINY_GSM_PHONEBOOK_RESULTS indices are returned.
+    // Make your query more specific if you have more results than that.
+    // Use characters found in the GSM alphabet.
+
+    changeCharacterSet(GF("GSM"));
+    sendAT(GF("+CPBF=\""), needle, '"'); // Find Phonebook Entries
+
+    // AT response:
+    // [+CPBF:<index1>,<number>,<type>,<text>]
+    // [[...]<CR><LF>+CBPF:<index2>,<number>,<type>,<text>]
+    if (waitResponse(30000L, GF(GSM_NL "+CPBF: ")) != 1) {
+      stream.readString();
+      return {};
+    }
+
+    PhonebookMatches matches;
+    for (uint8_t i = 0; i < TINY_GSM_PHONEBOOK_RESULTS; ++i) {
+      matches.index[i] = static_cast<uint8_t>(stream.readStringUntil(',').toInt());
+      if (waitResponse(GF(GSM_NL "+CPBF: ")) != 1) {
+        break;
+      }
+    }
+
+    waitResponse();
+
+    return matches;
+  }
+
 
   /*
-   * GPS/GNSS/GLONASS location functions
+   * Location functions
    */
  protected:
-  // No functions of this type supported
+  String getGsmLocation() {
+    sendAT(GF("+CIPGSMLOC=1,1"));
+    if (waitResponse(10000L, GF(GSM_NL "+CIPGSMLOC:")) != 1) {
+      return "";
+    }
+    String res = stream.readStringUntil('\n');
+    waitResponse();
+    res.trim();
+    return res;
+  }
 
   /*
    * Time functions
    */
  protected:
-  // Can follow the standard CCLK function in the template
+  String getGSMDateTime(TinyGSMDateTimeFormat format) {
+    sendAT(GF("+CCLK?"));
+    if (waitResponse(2000L, GF(GSM_NL "+CCLK: \"")) != 1) {
+      return "";
+    }
+
+    String res;
+
+    switch(format) {
+      case DATE_FULL:
+        res = stream.readStringUntil('"');
+      break;
+      case DATE_TIME:
+        streamSkipUntil(',');
+        res = stream.readStringUntil('"');
+      break;
+      case DATE_DATE:
+        res = stream.readStringUntil(',');
+      break;
+    }
+    return res;
+  }
 
   /*
-   * Battery functions
+   * Battery & temperature functions
    */
  protected:
-  // Follows all battery functions per template
+  // Use: float vBatt = modem.getBattVoltage() / 1000.0;
+  uint16_t getBattVoltage() {
+    sendAT(GF("+CBC"));
+    if (waitResponse(GF(GSM_NL "+CBC:")) != 1) {
+      return 0;
+    }
+    streamSkipUntil(','); // Skip battery charge status
+    streamSkipUntil(','); // Skip battery charge level
+    // return voltage in mV
+    uint16_t res = stream.readStringUntil(',').toInt();
+    // Wait for final OK
+    waitResponse();
+    return res;
+  }
+
+  int8_t getBattPercent() {
+    sendAT(GF("+CBC"));
+    if (waitResponse(GF(GSM_NL "+CBC:")) != 1) {
+      return false;
+    }
+    streamSkipUntil(','); // Skip battery charge status
+    // Read battery charge level
+    int res = stream.readStringUntil(',').toInt();
+    // Wait for final OK
+    waitResponse();
+    return res;
+  }
+
+  uint8_t getBattChargeState() {
+    sendAT(GF("+CBC?"));
+    if (waitResponse(GF(GSM_NL "+CBC:")) != 1) {
+      return false;
+    }
+    // Read battery charge status
+    int res = stream.readStringUntil(',').toInt();
+    // Wait for final OK
+    waitResponse();
+    return res;
+  }
+
+  bool getBattStats(uint8_t &chargeState, int8_t &percent, uint16_t &milliVolts) {
+    sendAT(GF("+CBC?"));
+    if (waitResponse(GF(GSM_NL "+CBC:")) != 1) {
+      return false;
+    }
+    chargeState = stream.readStringUntil(',').toInt();
+    percent = stream.readStringUntil(',').toInt();
+    milliVolts = stream.readStringUntil('\n').toInt();
+    // Wait for final OK
+    waitResponse();
+    return true;
+  }
+
+  float getTemperature() TINY_GSM_ATTR_NOT_AVAILABLE;
 
   /*
    * NTP server functions
